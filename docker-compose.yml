@@ -1,0 +1,13 @@
+services:
+  atomiq-monitor:
+    build: /home/liam/docker/compose/atomiq-monitor
+    container_name: atomiq-monitor
+    restart: unless-stopped
+    env_file: /home/liam/docker/compose/atomiq-monitor/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
