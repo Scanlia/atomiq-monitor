@@ -160,6 +160,7 @@ def check_api_health():
     if data is None or data.get("status") != "healthy":
         alert("api.health", f"API health check failed.\nURL: `{BASE_URL}/health`\nResponse: `{data}`")
     else:
+        log.info("OK [api.health]: %s", data.get("status"))
         recover("api.health", "API is healthy again.")
 
 
@@ -169,6 +170,7 @@ def check_blockchain_status():
     if data is None:
         alert("blockchain.status", f"Blockchain status endpoint unreachable.\nURL: `{BASE_URL}/status`")
         return
+    log.info("OK [blockchain.status]: endpoint reachable")
     recover("blockchain.status", "Blockchain status endpoint is responding again.")
 
     catching_up = data.get("sync_info", {}).get("catching_up", False)
@@ -184,6 +186,7 @@ def check_settlement_health():
     if data is None:
         alert("settlement.health", f"Settlement health endpoint unreachable.\nURL: `{BASE_URL}/api/settlement/health`")
         return
+    log.info("OK [settlement.health]: endpoint reachable")
     recover("settlement.health", "Settlement health endpoint is responding again.")
 
     # Processor heartbeat staleness
@@ -230,6 +233,7 @@ def check_casino_stats():
     if data is None:
         alert("casino.stats", f"Casino stats endpoint unreachable.\nURL: `{BASE_URL}/api/casino/stats`")
         return
+    log.info("OK [casino.stats]: endpoint reachable")
     recover("casino.stats", "Casino stats endpoint responding again.")
 
     bankroll = data.get("bankroll", 9999)
@@ -249,6 +253,7 @@ def check_metrics():
     try:
         r = requests.get(f"{BASE_URL}/metrics", timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
+        log.info("OK [metrics.endpoint]: HTTP %s", r.status_code)
         recover("metrics.endpoint", "Metrics endpoint is responding.")
     except Exception as e:
         alert("metrics.endpoint", f"Prometheus metrics endpoint is unreachable.\nError: `{e}`")
