@@ -111,8 +111,13 @@ def send_email(subject: str, body: str):
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(EMAIL_FROM, EMAIL_RECIPIENTS, msg.as_string())
+        log.info("Email sent: %s", subject)
     except Exception as e:
         log.warning("Email send failed: %s", e)
+
+# Pending email digests accumulated within a single run_checks() cycle
+_pending_alerts: list[str] = []
+_pending_recoveries: list[str] = []
 
 def alert(key: str, message: str, level: str = "🔴"):
     if not should_alert(key):
@@ -123,7 +128,7 @@ def alert(key: str, message: str, level: str = "🔴"):
     send_discord(full)
     send_telegram(full)
     send_homeassistant("Atomiq Monitor Alert", full)
-    send_email(f"[Atomiq Monitor] Alert: {key}", full)
+    _pending_alerts.append(f"[{key}]\n{message}")
 
 def recover(key: str, message: str):
     if key not in last_alerted:
@@ -135,7 +140,7 @@ def recover(key: str, message: str):
     send_discord(full)
     send_telegram(full)
     send_homeassistant("Atomiq Monitor Recovered", full)
-    send_email(f"[Atomiq Monitor] Recovered: {key}", full)
+    _pending_recoveries.append(message)
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
@@ -260,12 +265,29 @@ CHECKS = [
 ]
 
 def run_checks():
+    global _pending_alerts, _pending_recoveries
+    _pending_alerts = []
+    _pending_recoveries = []
     log.info("── Running %d checks against %s ──", len(CHECKS), BASE_URL)
     for name, fn in CHECKS:
         try:
             fn()
         except Exception as e:
             log.error("Unhandled error in check '%s': %s", name, e)
+    # Send a single digest email if anything fired
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if _pending_alerts:
+        subject = f"[Atomiq Monitor] {len(_pending_alerts)} Alert(s) — {ts}"
+        body = f"Atomiq Monitor detected {len(_pending_alerts)} issue(s) at {ts}:\n\n"
+        body += "\n\n".join(f"🔴 {a}" for a in _pending_alerts)
+        if _pending_recoveries:
+            body += "\n\n── Recoveries ──\n" + "\n".join(f"✅ {r}" for r in _pending_recoveries)
+        send_email(subject, body)
+    elif _pending_recoveries:
+        subject = f"[Atomiq Monitor] {len(_pending_recoveries)} Recovery(s) — {ts}"
+        body = f"Atomiq Monitor recoveries at {ts}:\n\n"
+        body += "\n".join(f"✅ {r}" for r in _pending_recoveries)
+        send_email(subject, body)
 
 def main():
     log.info("Atomiq Monitor starting (interval=%ds, base=%s)", CHECK_INTERVAL, BASE_URL)
