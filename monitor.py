@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 
 BASE_URL          = os.environ.get("ATOMIQ_BASE_URL", "http://host.docker.internal:8080")
 CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "60"))        # seconds
-ALERT_COOLDOWN    = int(os.environ.get("ALERT_COOLDOWN", "300"))       # seconds between repeat alerts per check
 REQUEST_TIMEOUT   = int(os.environ.get("REQUEST_TIMEOUT", "10"))       # seconds per HTTP request
 
 # Thresholds
@@ -53,20 +52,50 @@ logging.basicConfig(
 )
 log = logging.getLogger("monitor")
 
-# ── Alert state (cooldown tracking) ──────────────────────────────────────────
+# ── Alert state (exponential backoff, tracks time-down) ──────────────────
+#
+# Backoff schedule (capped at 1 h): 5 m → 10 m → 20 m → 40 m → 60 m → 60 m …
+_BACKOFF_STEPS = [300, 600, 1200, 2400, 3600]  # seconds
+_MAX_INTERVAL  = 3600
 
-last_alerted: dict[str, float] = {}
+# Per-key state: {"first": float, "last": float, "step": int}
+alert_state: dict[str, dict] = {}
+
+def _fmt_duration(seconds: float) -> str:
+    """Return a human-readable duration string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m = s // 60
+    if m < 60:
+        return f"{m}m"
+    h, rem = divmod(m, 60)
+    return f"{h}h {rem}m" if rem else f"{h}h"
 
 def should_alert(key: str) -> bool:
     now = time.time()
-    if now - last_alerted.get(key, 0) >= ALERT_COOLDOWN:
-        last_alerted[key] = now
+    state = alert_state.get(key)
+    if state is None:
+        # First occurrence
+        alert_state[key] = {"first": now, "last": now, "step": 0}
+        return True
+    interval = _BACKOFF_STEPS[min(state["step"], len(_BACKOFF_STEPS) - 1)]
+    if now - state["last"] >= interval:
+        state["last"] = now
+        state["step"] = min(state["step"] + 1, len(_BACKOFF_STEPS) - 1)
         return True
     return False
 
+def time_down(key: str) -> str:
+    """Return formatted duration the alert has been active, or empty string."""
+    state = alert_state.get(key)
+    if state is None:
+        return ""
+    return _fmt_duration(time.time() - state["first"])
+
 def clear_alert(key: str):
     """Call when a previously failing check recovers."""
-    last_alerted.pop(key, None)
+    alert_state.pop(key, None)
 
 # ── Notification senders ─────────────────────────────────────────────────────
 
@@ -122,25 +151,29 @@ _pending_recoveries: list[str] = []
 def alert(key: str, message: str, level: str = "🔴"):
     if not should_alert(key):
         return
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    full = f"{level} **[Atomiq Monitor]** `{ts}`\n{message}"
-    log.warning("ALERT [%s]: %s", key, message)
+    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    td  = time_down(key)
+    td_str = f"  ⏱ Down for: **{td}**" if td else ""
+    full = f"{level} **[Atomiq Monitor]** `{ts}`\n{message}{td_str}"
+    log.warning("ALERT [%s] (down %s): %s", key, td or "<1m", message)
     send_discord(full)
     send_telegram(full)
     send_homeassistant("Atomiq Monitor Alert", full)
-    _pending_alerts.append(f"[{key}]\n{message}")
+    _pending_alerts.append(f"[{key}] (down {td or '<1m'})\n{message}")
 
 def recover(key: str, message: str):
-    if key not in last_alerted:
+    if key not in alert_state:
         return  # Was never in alert state — no need to notify
+    td = time_down(key)
     clear_alert(key)
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    full = f"✅ **[Atomiq Monitor]** `{ts}`\n{message}"
-    log.info("RECOVERED [%s]: %s", key, message)
+    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    td_str = f"  ⏱ Was down for: **{td}**" if td else ""
+    full = f"✅ **[Atomiq Monitor]** `{ts}`\n{message}{td_str}"
+    log.info("RECOVERED [%s] (was down %s): %s", key, td or "<1m", message)
     send_discord(full)
     send_telegram(full)
     send_homeassistant("Atomiq Monitor Recovered", full)
-    _pending_recoveries.append(message)
+    _pending_recoveries.append(f"{message}  (was down {td or '<1m'})")
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
@@ -283,7 +316,8 @@ def run_checks():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     if _pending_alerts:
         subject = f"[Atomiq Monitor] {len(_pending_alerts)} Alert(s) — {ts}"
-        body = f"Atomiq Monitor detected {len(_pending_alerts)} issue(s) at {ts}:\n\n"
+        body = f"Atomiq Monitor detected {len(_pending_alerts)} issue(s) at {ts}:\n"
+        body += "(Repeat notifications: 5m → 10m → 20m → 40m → 60m intervals, capped at 1h)\n\n"
         body += "\n\n".join(f"🔴 {a}" for a in _pending_alerts)
         if _pending_recoveries:
             body += "\n\n── Recoveries ──\n" + "\n".join(f"✅ {r}" for r in _pending_recoveries)
