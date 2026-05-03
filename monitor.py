@@ -22,9 +22,6 @@ CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "60"))        # seconds
 REQUEST_TIMEOUT   = int(os.environ.get("REQUEST_TIMEOUT", "10"))       # seconds per HTTP request
 
 # Thresholds
-MAX_PROCESSOR_STALE_SECS  = int(os.environ.get("MAX_PROCESSOR_STALE_SECS", "120"))   # alert if processor hasn't heartbeated
-MAX_PENDING_SETTLEMENTS   = int(os.environ.get("MAX_PENDING_SETTLEMENTS", "50"))     # alert if queue backs up
-MAX_FAILED_SETTLEMENTS    = int(os.environ.get("MAX_FAILED_SETTLEMENTS", "5"))       # alert on any stuck failures
 BANKROLL_WARN_THRESHOLD   = float(os.environ.get("BANKROLL_WARN_THRESHOLD", "10.0")) # SOL — warn if bankroll runs low
 
 # Notification channels (set at least one)
@@ -214,50 +211,16 @@ def check_blockchain_status():
 
 
 def check_settlement_health():
-    """GET /api/settlement/health — processor liveness + queue depth."""
+    """GET /api/settlement/health — endpoint reachability only.
+    Processor/queue checks removed: settlement processing is now handled
+    directly by the blockchain node.
+    """
     data = get("/api/settlement/health")
     if data is None:
         alert("settlement.health", f"Settlement health endpoint unreachable.\nURL: `{BASE_URL}/api/settlement/health`")
         return
     log.info("OK [settlement.health]: endpoint reachable")
     recover("settlement.health", "Settlement health endpoint is responding again.")
-
-    # Processor heartbeat staleness
-    stale_secs = data.get("processor_last_seen_secs", 9999)
-    if stale_secs > MAX_PROCESSOR_STALE_SECS:
-        alert(
-            "settlement.processor",
-            f"Settlement processor has not heartbeated for **{stale_secs}s** (threshold: {MAX_PROCESSOR_STALE_SECS}s).\n"
-            f"The processor may be down.",
-        )
-    else:
-        recover("settlement.processor", f"Settlement processor is heartbeating normally ({stale_secs}s ago).")
-
-    # Stuck / has_stuck flag
-    if data.get("has_stuck"):
-        alert("settlement.stuck", "Settlement queue has **stuck** transactions that cannot be processed.")
-    else:
-        recover("settlement.stuck", "No stuck settlements detected.")
-
-    # Pending queue depth
-    pending = data.get("pending_count", 0)
-    if pending > MAX_PENDING_SETTLEMENTS:
-        alert(
-            "settlement.pending",
-            f"Settlement pending queue is backing up: **{pending}** pending (threshold: {MAX_PENDING_SETTLEMENTS}).",
-        )
-    else:
-        recover("settlement.pending", f"Settlement pending queue is normal ({pending} pending).")
-
-    # Failed count
-    failed = data.get("failed_count", 0)
-    if failed > MAX_FAILED_SETTLEMENTS:
-        alert(
-            "settlement.failed",
-            f"Settlement has **{failed}** failed transactions (threshold: {MAX_FAILED_SETTLEMENTS}).",
-        )
-    else:
-        recover("settlement.failed", f"Settlement failed count is normal ({failed} failed).")
 
 
 def check_casino_stats():
