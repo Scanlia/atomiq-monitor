@@ -18,8 +18,9 @@ from datetime import datetime, timezone
 # ── Configuration (override via environment variables) ────────────────────────
 
 BASE_URL          = os.environ.get("ATOMIQ_BASE_URL", "http://host.docker.internal:8080")
-CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "60"))        # seconds
-REQUEST_TIMEOUT   = int(os.environ.get("REQUEST_TIMEOUT", "10"))       # seconds per HTTP request
+CHECK_INTERVAL      = int(os.environ.get("CHECK_INTERVAL", "60"))        # seconds
+REQUEST_TIMEOUT     = int(os.environ.get("REQUEST_TIMEOUT", "10"))       # seconds per HTTP request
+ALERT_CONFIRM_COUNT = int(os.environ.get("ALERT_CONFIRM_COUNT", "2"))    # consecutive failures before alerting
 
 # Thresholds
 BANKROLL_WARN_THRESHOLD   = float(os.environ.get("BANKROLL_WARN_THRESHOLD", "10.0")) # SOL — warn if bankroll runs low
@@ -55,7 +56,9 @@ log = logging.getLogger("monitor")
 _BACKOFF_STEPS = [300, 600, 1200, 2400, 3600]  # seconds
 _MAX_INTERVAL  = 3600
 
-# Per-key state: {"first": float, "last": float, "step": int}
+# Per-key state: {"first": float, "last": float, "step": int, "streak": int, "pending": bool}
+# streak  = consecutive failure count (resets on recovery)
+# pending = True while streak >= 1 but < ALERT_CONFIRM_COUNT (not yet notified)
 alert_state: dict[str, dict] = {}
 
 def _fmt_duration(seconds: float) -> str:
@@ -70,18 +73,33 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}h {rem}m" if rem else f"{h}h"
 
 def should_alert(key: str) -> bool:
+    """Returns True when the failure is confirmed and a notification should fire."""
     now = time.time()
     state = alert_state.get(key)
     if state is None:
-        # First occurrence
-        alert_state[key] = {"first": now, "last": now, "step": 0}
-        return True
+        # First failure — start streak, don't notify yet
+        alert_state[key] = {"first": now, "last": now, "step": 0, "streak": 1, "pending": True}
+        return False
+    state["streak"] += 1
+    if state["pending"]:
+        # Still in confirmation window
+        if state["streak"] >= ALERT_CONFIRM_COUNT:
+            state["pending"] = False
+            state["last"] = now
+            return True
+        return False
+    # Already confirmed — apply backoff for repeats
     interval = _BACKOFF_STEPS[min(state["step"], len(_BACKOFF_STEPS) - 1)]
     if now - state["last"] >= interval:
         state["last"] = now
         state["step"] = min(state["step"] + 1, len(_BACKOFF_STEPS) - 1)
         return True
     return False
+
+def is_in_alert(key: str) -> bool:
+    """True if this key has been confirmed and notified (not just pending)."""
+    state = alert_state.get(key)
+    return state is not None and not state.get("pending", True)
 
 def time_down(key: str) -> str:
     """Return formatted duration the alert has been active, or empty string."""
@@ -159,10 +177,11 @@ def alert(key: str, message: str, level: str = "🔴"):
     _pending_alerts.append(f"[{key}] (down {td or '<1m'})\n{message}")
 
 def recover(key: str, message: str):
-    if key not in alert_state:
-        return  # Was never in alert state — no need to notify
+    was_confirmed = is_in_alert(key)
     td = time_down(key)
     clear_alert(key)
+    if not was_confirmed:
+        return  # Transient blip — never confirmed, skip recovery notification
     ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     td_str = f"  ⏱ Was down for: **{td}**" if td else ""
     full = f"✅ **[Atomiq Monitor]** `{ts}`\n{message}{td_str}"
