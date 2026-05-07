@@ -20,7 +20,9 @@ from datetime import datetime, timezone
 BASE_URL          = os.environ.get("ATOMIQ_BASE_URL", "http://host.docker.internal:8080")
 CHECK_INTERVAL      = int(os.environ.get("CHECK_INTERVAL", "60"))        # seconds
 REQUEST_TIMEOUT     = int(os.environ.get("REQUEST_TIMEOUT", "10"))       # seconds per HTTP request
-ALERT_CONFIRM_COUNT = int(os.environ.get("ALERT_CONFIRM_COUNT", "2"))    # consecutive failures before alerting
+ALERT_CONFIRM_COUNT = int(os.environ.get("ALERT_CONFIRM_COUNT", "2"))    # consecutive failed cycles before alerting
+PROBE_RETRIES       = int(os.environ.get("PROBE_RETRIES", "5"))          # rapid retries per check before marking failed
+PROBE_RETRY_DELAY   = float(os.environ.get("PROBE_RETRY_DELAY", "1.0"))  # seconds between rapid retries
 
 # Thresholds
 BANKROLL_WARN_THRESHOLD   = float(os.environ.get("BANKROLL_WARN_THRESHOLD", "10.0")) # SOL — warn if bankroll runs low
@@ -159,22 +161,17 @@ def send_email(subject: str, body: str):
     except Exception as e:
         log.warning("Email send failed: %s", e)
 
-# Pending email digests accumulated within a single run_checks() cycle
-_pending_alerts: list[str] = []
-_pending_recoveries: list[str] = []
+# Pending digests accumulated within a single run_checks() cycle
+_pending_alerts: list[tuple] = []
+_pending_recoveries: list[tuple] = []
 
 def alert(key: str, message: str, level: str = "🔴"):
     if not should_alert(key):
         return
-    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    td  = time_down(key)
-    td_str = f"  ⏱ Down for: **{td}**" if td else ""
-    full = f"{level} **[Atomiq Monitor]** `{ts}`\n{message}{td_str}"
+    td = time_down(key)
     log.warning("ALERT [%s] (down %s): %s", key, td or "<1m", message)
-    send_discord(full)
-    send_telegram(full)
-    send_homeassistant("Atomiq Monitor Alert", full)
-    _pending_alerts.append(f"[{key}] (down {td or '<1m'})\n{message}")
+    send_homeassistant("Atomiq Monitor Alert", f"{level} {message}  (down {td or '<1m'})")
+    _pending_alerts.append((key, message, level, td or "<1m"))
 
 def recover(key: str, message: str):
     was_confirmed = is_in_alert(key)
@@ -182,32 +179,44 @@ def recover(key: str, message: str):
     clear_alert(key)
     if not was_confirmed:
         return  # Transient blip — never confirmed, skip recovery notification
-    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    td_str = f"  ⏱ Was down for: **{td}**" if td else ""
-    full = f"✅ **[Atomiq Monitor]** `{ts}`\n{message}{td_str}"
     log.info("RECOVERED [%s] (was down %s): %s", key, td or "<1m", message)
-    send_discord(full)
-    send_telegram(full)
-    send_homeassistant("Atomiq Monitor Recovered", full)
-    _pending_recoveries.append(f"{message}  (was down {td or '<1m'})")
+    send_homeassistant("Atomiq Monitor Recovered", f"✅ {message}  (was down {td or '<1m'})")
+    _pending_recoveries.append((message, td or "<1m"))
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
 def get(path: str) -> dict | None:
-    try:
-        r = requests.get(f"{BASE_URL}{path}", timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.debug("GET %s failed: %s", path, e)
-        return None
+    """GET with rapid retries before giving up."""
+    for attempt in range(1, PROBE_RETRIES + 1):
+        try:
+            r = requests.get(f"{BASE_URL}{path}", timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log.debug("GET %s attempt %d/%d failed: %s", path, attempt, PROBE_RETRIES, e)
+            if attempt < PROBE_RETRIES:
+                time.sleep(PROBE_RETRY_DELAY)
+    return None
+
+def get_raw(path: str) -> requests.Response | None:
+    """GET with rapid retries, returns raw response (for non-JSON endpoints)."""
+    for attempt in range(1, PROBE_RETRIES + 1):
+        try:
+            r = requests.get(f"{BASE_URL}{path}", timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            log.debug("GET %s attempt %d/%d failed: %s", path, attempt, PROBE_RETRIES, e)
+            if attempt < PROBE_RETRIES:
+                time.sleep(PROBE_RETRY_DELAY)
+    return None
 
 
 def check_api_health():
     """GET /health — basic liveness check."""
     data = get("/health")
     if data is None or data.get("status") != "healthy":
-        alert("api.health", f"API health check failed.\nURL: `{BASE_URL}/health`\nResponse: `{data}`")
+        alert("api.health", "API health check failed.")
     else:
         log.info("OK [api.health]: %s", data.get("status"))
         recover("api.health", "API is healthy again.")
@@ -217,7 +226,7 @@ def check_blockchain_status():
     """GET /status — block production / sync state."""
     data = get("/status")
     if data is None:
-        alert("blockchain.status", f"Blockchain status endpoint unreachable.\nURL: `{BASE_URL}/status`")
+        alert("blockchain.status", "Blockchain status endpoint unreachable.")
         return
     log.info("OK [blockchain.status]: endpoint reachable")
     recover("blockchain.status", "Blockchain status endpoint is responding again.")
@@ -236,7 +245,7 @@ def check_settlement_health():
     """
     data = get("/api/settlement/health")
     if data is None:
-        alert("settlement.health", f"Settlement health endpoint unreachable.\nURL: `{BASE_URL}/api/settlement/health`")
+        alert("settlement.health", "Settlement health endpoint unreachable.")
         return
     log.info("OK [settlement.health]: endpoint reachable")
     recover("settlement.health", "Settlement health endpoint is responding again.")
@@ -246,7 +255,7 @@ def check_casino_stats():
     """GET /api/casino/stats — bankroll guard."""
     data = get("/api/casino/stats")
     if data is None:
-        alert("casino.stats", f"Casino stats endpoint unreachable.\nURL: `{BASE_URL}/api/casino/stats`")
+        alert("casino.stats", "Casino stats endpoint unreachable.")
         return
     log.info("OK [casino.stats]: endpoint reachable")
     recover("casino.stats", "Casino stats endpoint responding again.")
@@ -265,13 +274,12 @@ def check_casino_stats():
 
 def check_metrics():
     """GET /metrics — Prometheus endpoint sanity check."""
-    try:
-        r = requests.get(f"{BASE_URL}/metrics", timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
+    r = get_raw("/metrics")
+    if r is None:
+        alert("metrics.endpoint", "Prometheus metrics endpoint is unreachable.")
+    else:
         log.info("OK [metrics.endpoint]: HTTP %s", r.status_code)
         recover("metrics.endpoint", "Metrics endpoint is responding.")
-    except Exception as e:
-        alert("metrics.endpoint", f"Prometheus metrics endpoint is unreachable.\nError: `{e}`")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -294,21 +302,25 @@ def run_checks():
             fn()
         except Exception as e:
             log.error("Unhandled error in check '%s': %s", name, e)
-    # Send a single digest email if anything fired
+
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    if _pending_alerts:
-        subject = f"[Atomiq Monitor] {len(_pending_alerts)} Alert(s) — {ts}"
-        body = f"Atomiq Monitor detected {len(_pending_alerts)} issue(s) at {ts}:\n"
-        body += "(Repeat notifications: 5m → 10m → 20m → 40m → 60m intervals, capped at 1h)\n\n"
-        body += "\n\n".join(f"🔴 {a}" for a in _pending_alerts)
+
+    # Send one consolidated Telegram/Discord message per cycle
+    if _pending_alerts or _pending_recoveries:
+        lines = []
+        if _pending_alerts:
+            lines.append(f"🔴 *Atomiq Monitor* — {ts}")
+            for key, msg, level, td in _pending_alerts:
+                lines.append(f"{level} `{key}` ⏱ {td}\n  {msg.splitlines()[0]}")
         if _pending_recoveries:
-            body += "\n\n── Recoveries ──\n" + "\n".join(f"✅ {r}" for r in _pending_recoveries)
-        send_email(subject, body)
-    elif _pending_recoveries:
-        subject = f"[Atomiq Monitor] {len(_pending_recoveries)} Recovery(s) — {ts}"
-        body = f"Atomiq Monitor recoveries at {ts}:\n\n"
-        body += "\n".join(f"✅ {r}" for r in _pending_recoveries)
-        send_email(subject, body)
+            if _pending_alerts:
+                lines.append("")
+            lines.append("✅ *Recovered*")
+            for msg, td in _pending_recoveries:
+                lines.append(f"  • {msg.splitlines()[0]} _(was down {td})_")
+        digest = "\n".join(lines)
+        send_telegram(digest)
+        send_discord(digest)
 
 def main():
     log.info("Atomiq Monitor starting (interval=%ds, base=%s)", CHECK_INTERVAL, BASE_URL)
