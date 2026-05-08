@@ -35,6 +35,8 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 HA_BASE_URL        = os.environ.get("HA_BASE_URL", "")          # e.g. http://homeassistant:8123
 HA_TOKEN           = os.environ.get("HA_TOKEN", "")             # long-lived access token
 HA_NOTIFY_SERVICE  = os.environ.get("HA_NOTIFY_SERVICE", "notify.persistent_notification")
+# Metrics
+METRICS_API_KEY    = os.environ.get("METRICS_API_KEY", "")
 # Email
 EMAIL_RECIPIENTS   = [r.strip() for r in os.environ.get("EMAIL_RECIPIENTS", "").split(",") if r.strip()]
 SMTP_HOST          = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -274,12 +276,19 @@ def check_casino_stats():
 
 def check_metrics():
     """GET /metrics — Prometheus endpoint sanity check."""
-    r = get_raw("/metrics")
-    if r is None:
-        alert("metrics.endpoint", "Prometheus metrics endpoint is unreachable.")
-    else:
-        log.info("OK [metrics.endpoint]: HTTP %s", r.status_code)
-        recover("metrics.endpoint", "Metrics endpoint is responding.")
+    headers = {"Authorization": f"Bearer {METRICS_API_KEY}"} if METRICS_API_KEY else {}
+    for attempt in range(1, PROBE_RETRIES + 1):
+        try:
+            r = requests.get(f"{BASE_URL}/metrics", headers=headers, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            log.info("OK [metrics.endpoint]: HTTP %s", r.status_code)
+            recover("metrics.endpoint", "Metrics endpoint is responding.")
+            return
+        except Exception as e:
+            log.debug("GET /metrics attempt %d/%d failed: %s", attempt, PROBE_RETRIES, e)
+            if attempt < PROBE_RETRIES:
+                time.sleep(PROBE_RETRY_DELAY)
+    alert("metrics.endpoint", "Prometheus metrics endpoint is unreachable.")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
